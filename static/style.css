@@ -221,3 +221,24 @@ border-radius: 0 0 15px 15px !important;
 	margin-bottom: 15px !important;
 }
 }
+
+/* Typing indicator styling for bot */
+.msg_cotainer.typing{
+	width: 70px;
+	padding: 10px 12px;
+	border-radius: 10px;
+	background: #e9ecef;
+	color: #333;
+}
+.typing-dot{
+	display: inline-block;
+	width: 6px;
+	height: 6px;
+	margin: 0 3px;
+	background: #333;
+	border-radius: 50%;
+	animation: blink 1s infinite alternate;
+}
+.typing-dot:nth-child(2){ animation-delay: 0.2s; }
+.typing-dot:nth-child(3){ animation-delay: 0.4s; }
+@keyframes blink{ from { opacity: 0.2 } to { opacity: 1 } }

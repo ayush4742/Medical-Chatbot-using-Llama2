@@ -5,6 +5,8 @@ import pinecone
 from langchain.prompts import PromptTemplate
 from langchain.llms import CTransformers
 from langchain.chains import RetrievalQA
+import time
+from collections import OrderedDict
 from dotenv import load_dotenv
 from src.prompt import *
 import os
@@ -14,26 +16,47 @@ app = Flask(__name__)
 load_dotenv()
 
 PINECONE_API_KEY = os.environ.get('PINECONE_API_KEY')
-PINECONE_INDEX_NAME = os.environ.get('PINECONE_INDEX_NAME')
+index_name = os.environ.get('PINECONE_INDEX_NAME', 'medical-bot')
 
 # --- Safety checks (optional but helpful) ---
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY is not set in .env")
-if not PINECONE_INDEX_NAME:
-    raise ValueError("PINECONE_INDEX_NAME is not set in .env")
+if not index_name:
+    raise ValueError("PINECONE_INDEX_NAME (Pinecone index name) is not set in .env")
 
 # 1) Embeddings model  (all-MiniLM-L6-v2 → 384-dim)
 embeddings = download_hugging_face_embeddings()
 
 # 2) Initialize Pinecone client and index
 pc = pinecone.Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX_NAME)
+index = pc.Index(index_name)
 
 # 3) Vector store wrapper
 docsearch = PineconeVectorStore.from_existing_index(
-    index_name=PINECONE_INDEX_NAME,
-    embedding=embeddings
+    index_name=index_name,
+    embedding=embeddings,
 )
+
+# simple in-memory LRU cache to speed up repeated queries
+class LRUCache:
+    def __init__(self, capacity: int = 200):
+        self.capacity = capacity
+        self.cache = OrderedDict()
+
+    def get(self, key: str):
+        v = self.cache.get(key)
+        if v is not None:
+            self.cache.move_to_end(key)
+        return v
+
+    def set(self, key: str, value):
+        self.cache[key] = value
+        self.cache.move_to_end(key)
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
+
+
+CACHE = LRUCache(capacity=300)
 
 # 4) Prompt (imported from src.prompt)
 PROMPT = PromptTemplate(
@@ -48,19 +71,19 @@ llm = CTransformers(
     model="model/llama-2-7b-chat.ggmlv3.q4_0.bin",
     model_type="llama",
     config={
-        "max_new_tokens": 200,       # chhota output
-        "temperature": 0.1,          # zyada random nahi
-        "top_k": 40,
-        "top_p": 0.9,
-        "repetition_penalty": 1.2    # repeat kam karega
-    }
+        'max_new_tokens': 128,
+        'temperature': 0.5,
+        # optionally tighten sampling for more focused output
+        'top_p': 0.9,
+    },
 )
 
 # 6) Retrieval QA chain
+ # lower retrieval size (k) to speed up the retrieval step (tradeoff: less context)
 qa = RetrievalQA.from_chain_type(
     llm=llm,
     chain_type="stuff",
-    retriever=docsearch.as_retriever(search_kwargs={"k": 5}),  # was k=2
+    retriever=docsearch.as_retriever(search_kwargs={"k": 2}),
     return_source_documents=True,
     chain_type_kwargs=chain_type_kwargs,
 )
@@ -73,15 +96,26 @@ def index():
 @app.route("/get", methods=["POST"])
 def chat():
     user_msg = request.form["msg"]
+    normalized = user_msg.strip()
+
+    # return cached answer when available — very fast for repeated user queries
+    cached = CACHE.get(normalized)
+    if cached is not None:
+        print("[cache hit]", normalized)
+        return cached
 
     print("\n========================")
     print("User question:", user_msg)
 
+    start = time.time()
     try:
         result = qa({"query": user_msg})
     except Exception as e:
         print("Error while generating answer:", e)
         return "Sorry, something went wrong while generating the answer."
+
+    elapsed = time.time() - start
+    print(f"Response time: {elapsed:.2f}s")
 
     answer = result["result"]
     sources = result.get("source_documents", [])
@@ -93,6 +127,9 @@ def chat():
         snippet = doc.page_content[:300].replace("\n", " ")
         print(f"[{i}] {src} :: {snippet}...")
     print("========================\n")
+
+    # cache the final answer for quick repeat responses
+    CACHE.set(normalized, str(answer))
 
     return str(answer)
 
